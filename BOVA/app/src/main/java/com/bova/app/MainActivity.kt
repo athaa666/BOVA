@@ -1,3 +1,162 @@
+package com.bova.app
+
+import android.Manifest
+import android.os.Build
+import android.os.Bundle
+import android.os.SystemClock
+import android.view.WindowManager
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.unit.dp
+import androidx.core.view.WindowCompat
+import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
+import com.bova.app.data.BovaDao
+import com.bova.app.data.BovaDatabase
+import com.bova.app.data.Note
+import com.bova.app.ui.*
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+
+class MainActivity : FragmentActivity() {
+    private val permissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    private var settingsRef: AppSettings? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        Notifier.ensureChannels(this)
+        if (Build.VERSION.SDK_INT >= 33 && !Notifier.canNotify(this)) {
+            LockState.external()
+            permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
+        val db = BovaDatabase.get(this)
+        val settings = AppSettings(this)
+        settingsRef = settings
+        val env = AppEnv(applicationContext, db, settings)
+        if (savedInstanceState == null) LockState.locked = settings.lockEnabled
+
+        lifecycleScope.launch {
+            try {
+                val dao = db.dao()
+                if (!settings.seeded && dao.countClasses() == 0) DefaultData.classes.forEach { dao.upsertClass(it) }
+                else fillDefaultCodes(dao)
+                settings.seeded = true
+                dao.deleteBlankNotes()
+                Reschedule.all(applicationContext)
+            } catch (e: Exception) {
+                env.toast("Gagal menyiapkan data: ${e.message}")
+            }
+        }
+        setContent { BovaRoot(env) }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        LockState.lastBackground = SystemClock.elapsedRealtime()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        val suppressed = LockState.consumeSuppress()
+        val s = settingsRef ?: return
+        if (suppressed || !s.lockEnabled || LockState.locked || LockState.lastBackground == 0L) return
+        val away = (SystemClock.elapsedRealtime() - LockState.lastBackground) / 1000L
+        if (away >= s.autoLockSec) LockState.locked = true
+    }
+
+    private suspend fun fillDefaultCodes(dao: BovaDao) {
+        val existing = dao.allClasses()
+        existing.filter { it.code.isBlank() }.forEach { c ->
+            val d = DefaultData.classes.firstOrNull { it.title == c.title && it.day == c.day && it.startMin == c.startMin }
+            if (d != null) dao.upsertClass(c.copy(code = d.code, sks = d.sks))
+        }
+    }
+}
+
+private val tabs = listOf(
+    "Beranda" to Icons.Default.Home,
+    "Catatan" to Icons.Default.StickyNote2,
+    "Tugas" to Icons.Default.CheckCircle,
+    "Jadwal" to Icons.Default.CalendarMonth,
+    "Uang" to Icons.Default.AccountBalanceWallet
+)
+
+@Composable
+private fun BovaRoot(env: AppEnv) {
+    val s = env.settings
+    val ctx = LocalContext.current
+    val dark = when (s.themeMode) { 1 -> false; 2 -> true; else -> isSystemInDarkTheme() }
+    val dao = env.dao
+
+    val notes by dao.observeNotes().collectAsStateWithLifecycle(initialValue = emptyList())
+    val transactions by dao.observeTransactions().collectAsStateWithLifecycle(initialValue = emptyList())
+    val classes by dao.observeClasses().collectAsStateWithLifecycle(initialValue = emptyList())
+    val sessions by dao.observeSessions().collectAsStateWithLifecycle(initialValue = emptyList())
+    val tasks by dao.observeTasks().collectAsStateWithLifecycle(initialValue = emptyList())
+    val budgets by dao.observeBudgets().collectAsStateWithLifecycle(initialValue = emptyList())
+
+    var tab by rememberSaveable { mutableStateOf(s.startTab) }
+    var showSettings by rememberSaveable { mutableStateOf(false) }
+    var showFocus by rememberSaveable { mutableStateOf(false) }
+    var openNoteId by remember { mutableStateOf<Long?>(null) }
+    var photoUri by remember { mutableStateOf<String?>(null) }
+    var lastNote by remember { mutableStateOf<Note?>(null) }
+    var lastPhoto by remember { mutableStateOf<String?>(null) }
+    var pendingNote by remember { mutableStateOf(false) }
+    var pendingTask by remember { mutableStateOf(false) }
+    var pendingMoney by remember { mutableStateOf(false) }
+    var prefill by remember { mutableStateOf<Pair<String, Long>?>(null) }
+    var splash by remember { mutableStateOf(true) }
+
+    val openNote = notes.firstOrNull { it.id == openNoteId }
+    LaunchedEffect(openNote) { if (openNote != null) lastNote = openNote }
+    LaunchedEffect(photoUri) { if (photoUri != null) lastPhoto = photoUri }
+    LaunchedEffect(Unit) { delay(900); splash = false }
+
+    // timer: cek tiap detik apakah sesi sudah selesai
+    LaunchedEffect(Unit) {
+        while (true) { TimerController.checkDone(ctx, s, dao); delay(1000) }
+    }
+
+    // ikon status bar + FLAG_SECURE mengikuti pengaturan
+    val view = LocalView.current
+    SideEffect {
+        val window = (view.context as android.app.Activity).window
+        val c = WindowCompat.getInsetsController(window, view)
+        c.isAppearanceLightStatusBars = !dark
+        c.isAppearanceLightNavigationBars = !dark
+        if (s.secureWindow) window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+    }
+
+    BovaTheme(dark) {
+        Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+            if (LockState.locked && !splash) {
+                LockScreen(s) { LockState.locked = false }
+            } else if (!LockState.locked) {
                 Box(Modifier.fillMaxSize()) {
                     Scaffold(
                         containerColor = MaterialTheme.colorScheme.background,
